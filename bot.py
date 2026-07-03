@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
-# Telegram bot with forced channel membership (@datacheak) for non-admin/non-approved users.
-# Requirements: pip install python-telegram-bot aiohttp motor
+"""
+Telegram phone-lookup bot with Mongo persistence, forced channel membership,
+admin/approval, rate-limiting, inline buttons, and formatted API output.
 
-import asyncio
+Environment variables (required):
+  TELEGRAM_BOT_TOKEN   - Telegram bot token
+  MONGODB_URI          - MongoDB connection string
+  ADMIN_IDS            - comma-separated numeric Telegram user ids (admins)
+  FORCE_CHANNEL        - channel username (e.g. @datacheak)
+  API_BASE             - external API base URL (e.g. https://.../tg2phone/api)
+  API_KEY              - external API key
+Optional env:
+  RATE_LIMIT_COUNT     - default 10
+  RATE_LIMIT_WINDOW    - seconds, default 3600
+  CALLBACK_TTL         - seconds for callback docs TTL, default 3600
+  BROADCAST_DELAY      - float seconds, default 0.06
+"""
+import os
 import uuid
+import asyncio
+import json
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple, Any, Dict
 
 import aiohttp
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -14,30 +30,24 @@ from urllib.parse import quote_plus
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ----------------- CONFIG (from your input) -----------------
-# Provided by you:
-TOKEN = "8794125671:AAEJltnbzbA9ITaN09wuZ0byV0QDqVZXAAY"
-MONGO_URI = "mongodb+srv://yb131567_db_user:R8zxuvc9Qn999Arg@cluster0.drjaxl8.mongodb.net/telegram_bot?retryWrites=true&w=majority"
-OWNER_ID = 7302427268  # owner/admin
-FORCE_CHANNEL = "@datacheak"  # channel from your link https://t.me/datacheak
+# ----------------- Config (from env) -----------------
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+MONGO_URI = os.environ.get("MONGODB_URI")
+ADMIN_IDS = set(int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip())
+FORCE_CHANNEL = os.environ.get("FORCE_CHANNEL", "@datacheak")
+API_BASE = os.environ.get("API_BASE", "https://project-fawn-eight-95.vercel.app/tg2phone/api")
+API_KEY = os.environ.get("API_KEY", "Smoke")
 
-# API info
-API_BASE = "https://project-fawn-eight-95.vercel.app/tg2phone/api"
-API_KEY = "Smoke"
+RATE_LIMIT_COUNT = int(os.environ.get("RATE_LIMIT_COUNT", "10"))
+RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "3600"))
+CALLBACK_TTL = int(os.environ.get("CALLBACK_TTL", "3600"))
+BROADCAST_DELAY = float(os.environ.get("BROADCAST_DELAY", "0.06"))
 
-# Rate limiting for non-approved users
-RATE_LIMIT_COUNT = 10
-RATE_LIMIT_WINDOW = 3600  # seconds
-
-# Callback TTL in Mongo (seconds). Mongo TTL index will expire callback docs after this many seconds.
-CALLBACK_TTL = 3600
-
-# Broadcast send delay to avoid flood
-BROADCAST_DELAY = 0.06
-# -----------------------------------------------------------
-
-# Admin IDs set (owner included). You can add more comma-separated if you like.
-ADMIN_IDS = {OWNER_ID}
+if not TOKEN:
+    raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable.")
+if not MONGO_URI:
+    raise SystemExit("Set MONGODB_URI environment variable.")
+# ----------------------------------------------------
 
 # Mongo setup
 mongo = AsyncIOMotorClient(MONGO_URI)
@@ -46,59 +56,111 @@ users_col = db["users"]
 callbacks_col = db["callbacks"]
 usage_col = db["usage"]
 
-
 async def ensure_indexes():
+    # TTL indexes for callback and usage docs (expire docs automatically)
     try:
-        # callbacks TTL index on created_at
         await callbacks_col.create_index("created_at", expireAfterSeconds=CALLBACK_TTL)
-        # usage TTL index on ts
         await usage_col.create_index("ts", expireAfterSeconds=RATE_LIMIT_WINDOW)
-        # users unique index
         await users_col.create_index("user_id", unique=True)
         await users_col.create_index("username")
         await users_col.create_index("approved")
     except Exception as e:
         print("Index creation error:", e)
 
-
-# ---- External API call ----
-async def fetch_phone_for(target: str) -> str:
+# ----------------- External API -----------------
+async def fetch_phone_for(target: str) -> Tuple[Optional[Dict[str, Any]], str]:
     url = f"{API_BASE}?key={quote_plus(API_KEY)}&q={quote_plus(target)}"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=15) as resp:
-                content_type = resp.headers.get("Content-Type", "")
                 text = await resp.text()
+                content_type = resp.headers.get("Content-Type", "")
                 if "application/json" in content_type:
                     try:
                         data = await resp.json()
-                        import json
-
-                        return json.dumps(data, ensure_ascii=False, indent=2)
+                        return data, text
                     except Exception:
-                        return text or "(no data)"
-                return text or "(no data)"
+                        return None, text or ""
+                return None, text or ""
     except asyncio.TimeoutError:
-        return "Request timed out."
+        return None, "Request timed out."
     except Exception as e:
-        return f"Request failed: {e}"
+        return None, f"Request failed: {e}"
 
+# ----------------- Formatting -----------------
+def _get_bool(d, *keys):
+    for k in keys:
+        v = d.get(k)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, str)) and str(v).lower() in ("1", "true", "yes", "y", "on"):
+            return True
+    return False
 
-# ---- Helpers ----
+def format_result(target: str, data: Optional[Dict[str,Any]], raw: str) -> str:
+    if data:
+        username = data.get("username") or data.get("user") or data.get("name") or "—"
+        uid = data.get("id") or data.get("user_id") or data.get("uid") or (target if str(target).isdigit() else "—")
+        status = data.get("status") or data.get("presence") or "—"
+        dc = data.get("dc") or data.get("data_center") or data.get("server") or "—"
+
+        is_bot = _get_bool(data, "is_bot", "bot", "bot_account")
+        verified = _get_bool(data, "verified", "is_verified", "verified_account")
+        premium = _get_bool(data, "premium", "is_premium")
+
+        phone_field = data.get("phone") or data.get("number") or data.get("phone_number") or None
+        phone_number = "—"
+        phone_country = "—"
+        if isinstance(phone_field, dict):
+            phone_number = phone_field.get("number") or phone_field.get("value") or phone_field.get("phone") or "—"
+            phone_country = phone_field.get("country") or phone_field.get("country_name") or phone_field.get("country_code") or "—"
+            if phone_country and str(phone_country).isdigit():
+                phone_country = f"+{phone_country}"
+        elif isinstance(phone_field, str):
+            phone_number = phone_field
+            if phone_number.startswith("+"):
+                prefix = phone_number[1:4]
+                phone_country = "+" + prefix
+            else:
+                phone_country = "—"
+        else:
+            phone_number = data.get("phone_number") or data.get("mobile") or "—"
+            country = data.get("country") or data.get("country_name") or data.get("country_code")
+            if country:
+                phone_country = (f"+{country}" if str(country).isdigit() else country)
+
+        lines = []
+        lines.append(f"👤 {username}")
+        lines.append(f"🆔 {uid}")
+        lines.append(f"👁 Status  : {status}")
+        lines.append(f"🖥 DC      : {dc}")
+        lines.append("")
+        lines.append(f"🤖 Bot     : {'✅' if is_bot else '❌'}")
+        lines.append(f"✅ Verified: {'✅' if verified else '❌'}")
+        lines.append(f"⭐ Premium : {'✅' if premium else '❌'}")
+        lines.append("")
+        lines.append("📞 Phone")
+        lines.append(f"├ Number  : {phone_number}")
+        lines.append(f"└ Country : {phone_country}")
+        return "\n".join(lines)
+
+    raw_short = raw.strip()
+    if len(raw_short) > 3500:
+        raw_short = raw_short[:3500] + "\n... (truncated)"
+    return raw_short or "(no data returned)"
+
+# ----------------- Helpers & DB -----------------
 def normalize_input(raw: str) -> Optional[str]:
     if not raw:
         return None
-    raw = raw.strip()
-    if raw == "":
+    s = raw.strip()
+    if s.isdigit():
+        return s
+    if not s.startswith("@"):
+        s = "@" + s
+    if " " in s or len(s) > 64:
         return None
-    if raw.isdigit():
-        return raw
-    if not raw.startswith("@"):
-        raw = "@" + raw
-    if " " in raw or len(raw) > 64:
-        return None
-    return raw
-
+    return s
 
 async def record_user(tg_user):
     if not tg_user:
@@ -106,17 +168,10 @@ async def record_user(tg_user):
     now = datetime.now(timezone.utc)
     await users_col.update_one(
         {"user_id": tg_user.id},
-        {
-            "$set": {
-                "username": getattr(tg_user, "username", None),
-                "last_seen": now,
-                "is_bot": getattr(tg_user, "is_bot", False),
-            },
-            "$setOnInsert": {"first_seen": now, "approved": False},
-        },
+        {"$set": {"username": getattr(tg_user, "username", None), "last_seen": now, "is_bot": getattr(tg_user, "is_bot", False)},
+         "$setOnInsert": {"first_seen": now, "approved": False}},
         upsert=True,
     )
-
 
 async def is_admin_or_approved(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
@@ -124,8 +179,6 @@ async def is_admin_or_approved(user_id: int) -> bool:
     u = await users_col.find_one({"user_id": user_id}, {"approved": 1})
     return bool(u and u.get("approved"))
 
-
-# Rate limit check for unapproved users; admins/approved bypass
 async def is_allowed_and_record(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
@@ -138,38 +191,22 @@ async def is_allowed_and_record(user_id: int) -> bool:
     await usage_col.insert_one({"user_id": user_id, "ts": datetime.now(timezone.utc)})
     return True
 
-
-# Check channel membership: admins and approved users bypass check.
-# Returns (True, None) if allowed; (False, message) if not allowed (message is user-facing).
-async def check_channel_membership_or_denied(update: Update, context: ContextTypes.DEFAULT_TYPE) -> (bool, Optional[str]):
+async def check_channel_membership_or_denied(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return False, "Unable to identify you."
-    # Admins and approved users bypass
     if await is_admin_or_approved(user.id):
         return True, None
-
-    # Try to get chat member status
     try:
         member = await context.bot.get_chat_member(FORCE_CHANNEL, user.id)
     except Exception as e:
-        # Could be: bot not in channel, private channel, or other error
-        # Inform admin to add bot to channel as admin or make channel public
-        msg = (
-            "Bot cannot verify channel membership right now. Make sure the bot is added to the channel "
-            f"{FORCE_CHANNEL} and has permission to access members, or make the channel public. Error: {e}"
-        )
-        return False, msg
-
+        return False, f"Bot cannot verify membership. Make sure the bot is added to {FORCE_CHANNEL} and has permission. ({e})"
     status = getattr(member, "status", None)
-    # allowed statuses: 'creator', 'administrator', 'member'
     if status in ("creator", "administrator", "member"):
         return True, None
-    else:
-        return False, f"Please join the channel {FORCE_CHANNEL} to use this bot."
+    return False, f"Please join the channel {FORCE_CHANNEL} to use this bot."
 
-
-# ---- Command handlers ----
+# ----------------- Command Handlers -----------------
 async def phone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await record_user(update.effective_user)
     ok, deny_msg = await check_channel_membership_or_denied(update, context)
@@ -181,9 +218,9 @@ async def phone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     targets = []
     if args:
         for a in args:
-            norm = normalize_input(a)
-            if norm:
-                targets.append(norm)
+            n = normalize_input(a)
+            if n:
+                targets.append(n)
     else:
         if update.message and update.message.reply_to_message:
             r = update.message.reply_to_message.from_user
@@ -192,13 +229,11 @@ async def phone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     targets.append("@" + r.username)
                 else:
                     targets.append(str(r.id))
+
     if not targets:
-        await update.message.reply_text(
-            "Usage: /phone @username OR /phone username OR /phone <numeric_user_id>\nOr reply to a user's message with /phone"
-        )
+        await update.message.reply_text("Usage: /phone @username OR /phone username OR /phone <numeric_user_id> (or reply)")
         return
 
-    # create callback entries in Mongo
     keyboard = []
     for t in targets:
         key = uuid.uuid4().hex
@@ -209,21 +244,14 @@ async def phone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
         keyboard.append([InlineKeyboardButton(f"Get number for {t}", callback_data=key)])
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    warning = ""
-    if len(targets) > 30:
-        warning = "\n\nNote: many targets — UI may be large; Telegram limits apply."
-    text = "Ready to fetch phone numbers for:\n" + "\n".join(f"• {t}" for t in targets) + warning
-    await update.message.reply_text(text, reply_markup=reply_markup)
-
+    await update.message.reply_text("Ready to fetch phone numbers for:\n" + "\n".join(f"• {t}" for t in targets),
+                                    reply_markup=InlineKeyboardMarkup(keyboard))
 
 async def callback_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if not query or not query.data:
         return
     await record_user(query.from_user)
-
-    # Check channel membership for the pressing user
     ok, deny_msg = await check_channel_membership_or_denied(update, context)
     if not ok:
         try:
@@ -249,27 +277,31 @@ async def callback_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     target = cb["target"]
     try:
-        await query.edit_message_text(f"Fetching number for {target}...\n(asked by @{query.from_user.username or query.from_user.id})")
+        await query.edit_message_text(f"Fetching number for {target}...")
     except Exception:
         await query.message.reply_text(f"Fetching number for {target}...")
 
-    result = await fetch_phone_for(target)
-    final_text = f"Result for {target}:\n{result}\n\nDone."
+    data, raw = await fetch_phone_for(target)
 
+    # store API response into callbacks_col for audit (non-blocking)
     try:
-        await query.edit_message_text(final_text)
+        await callbacks_col.update_one({"key": key}, {"$set": {"api_raw": raw, "api_data": data, "fetched_at": datetime.now(timezone.utc)}})
     except Exception:
-        await query.message.reply_text(final_text)
+        pass
 
+    formatted = format_result(target, data, raw)
+    try:
+        await query.edit_message_text(formatted)
+    except Exception:
+        await query.message.reply_text(formatted)
 
-# Admin approve/unapprove/list commands (admins only)
+# Admin commands
 async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = update.effective_user
     if not sender or sender.id not in ADMIN_IDS:
         await update.message.reply_text("Unauthorized: only admins can approve users.")
         return
     await record_user(sender)
-
     target_arg = None
     args = context.args or []
     if args:
@@ -278,20 +310,14 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r = update.message.reply_to_message.from_user
         if r:
             target_arg = ("@" + r.username) if getattr(r, "username", None) else str(r.id)
-
     if not target_arg:
         await update.message.reply_text("Usage: /approve <@username|user_id> or reply to a user's message with /approve")
         return
-
     norm = normalize_input(target_arg) or target_arg
     now = datetime.now(timezone.utc)
     if norm.startswith("@"):
         uname = norm[1:]
-        await users_col.update_one(
-            {"username": uname},
-            {"$set": {"approved": True, "approved_by": sender.id, "approved_at": now, "username": uname}},
-            upsert=True,
-        )
+        await users_col.update_one({"username": uname}, {"$set": {"approved": True, "approved_by": sender.id, "approved_at": now, "username": uname}}, upsert=True)
         await update.message.reply_text(f"Approved {norm}. They have unlimited usage.")
     else:
         try:
@@ -299,13 +325,8 @@ async def approve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("Invalid target. Provide @username or numeric user id.")
             return
-        await users_col.update_one(
-            {"user_id": uid},
-            {"$set": {"approved": True, "approved_by": sender.id, "approved_at": now, "user_id": uid}},
-            upsert=True,
-        )
+        await users_col.update_one({"user_id": uid}, {"$set": {"approved": True, "approved_by": sender.id, "approved_at": now, "user_id": uid}}, upsert=True)
         await update.message.reply_text(f"Approved {uid}. They have unlimited usage.")
-
 
 async def unapprove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = update.effective_user
@@ -313,7 +334,6 @@ async def unapprove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Unauthorized: only admins can unapprove users.")
         return
     await record_user(sender)
-
     target_arg = None
     args = context.args or []
     if args:
@@ -322,11 +342,9 @@ async def unapprove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r = update.message.reply_to_message.from_user
         if r:
             target_arg = ("@" + r.username) if getattr(r, "username", None) else str(r.id)
-
     if not target_arg:
         await update.message.reply_text("Usage: /unapprove <@username|user_id> or reply to a user's message with /unapprove")
         return
-
     norm = normalize_input(target_arg) or target_arg
     if norm.startswith("@"):
         uname = norm[1:]
@@ -347,14 +365,12 @@ async def unapprove_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"No record for {uid}; treated as unapproved.")
 
-
 async def approveds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = update.effective_user
     if not sender or sender.id not in ADMIN_IDS:
         await update.message.reply_text("Unauthorized: only admins can list approved users.")
         return
     await record_user(sender)
-
     cursor = users_col.find({"approved": True}, {"user_id": 1, "username": 1, "approved_at": 1}).sort("approved_at", -1).limit(500)
     lines = []
     async for u in cursor:
@@ -365,7 +381,6 @@ async def approveds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not lines:
         await update.message.reply_text("No approved users.")
         return
-    # chunk messages
     chunk = []
     msg = ""
     for l in lines:
@@ -378,22 +393,15 @@ async def approveds_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for c in chunk:
         await update.message.reply_text(c)
 
-
 async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await record_user(update.effective_user)
     total_users = await users_col.count_documents({})
     approved_count = await users_col.count_documents({"approved": True})
     current_usages = await usage_col.count_documents({})
-    text = (
-        f"Stats:\n"
-        f"• Total distinct users: {total_users}\n"
-        f"• Approved users (unlimited): {approved_count}\n"
-        f"• API requests recorded (in TTL window): {current_usages}\n"
-        f"• Rate limit for normal users: {RATE_LIMIT_COUNT} requests per {RATE_LIMIT_WINDOW//3600} hour(s)\n"
-        f"• Admins (unlimited): {len(ADMIN_IDS)}\n"
-    )
+    text = (f"Stats:\n• Total distinct users: {total_users}\n• Approved users (unlimited): {approved_count}\n"
+            f"• API requests recorded (in TTL window): {current_usages}\n• Rate limit for normal users: {RATE_LIMIT_COUNT} requests per {RATE_LIMIT_WINDOW//3600} hour(s)\n"
+            f"• Admins (unlimited): {len(ADMIN_IDS)}")
     await update.message.reply_text(text)
-
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sender = update.effective_user
@@ -401,21 +409,16 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Unauthorized: only admins can broadcast.")
         return
     await record_user(sender)
-
     args = context.args or []
     if not args and update.message.reply_to_message:
         msg_text = update.message.reply_to_message.text or ""
     else:
         msg_text = " ".join(args).strip()
-
     if not msg_text:
         await update.message.reply_text("Usage: /broadcast <message>\nOr reply to a message and run /broadcast")
         return
-
     cursor = users_col.find({}, {"user_id": 1})
-    total = 0
-    sent = 0
-    failed = 0
+    total = sent = failed = 0
     async for u in cursor:
         total += 1
         uid = u["user_id"]
@@ -425,21 +428,16 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             failed += 1
         await asyncio.sleep(BROADCAST_DELAY)
-
     await update.message.reply_text(f"Broadcast done. Total users: {total}, sent: {sent}, failed: {failed}")
-
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await record_user(update.effective_user)
-    await update.message.reply_text(
-        f"Hello — send /phone @username or reply to a user with /phone.\nYou must be a member of {FORCE_CHANNEL} to use the bot (admins/approved users bypass)."
-    )
+    await update.message.reply_text(f"Hello — use /phone @username or reply to a user with /phone. Must be member of {FORCE_CHANNEL} (admins/approved bypass).")
 
-
+# ----------------- Startup -----------------
 async def main():
     await ensure_indexes()
     app = ApplicationBuilder().token(TOKEN).build()
-
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("phone", phone_cmd))
     app.add_handler(CallbackQueryHandler(callback_get_phone))
@@ -448,10 +446,8 @@ async def main():
     app.add_handler(CommandHandler("approveds", approveds_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-
     print("Bot started.")
     app.run_polling()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
