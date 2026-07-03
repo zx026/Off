@@ -3,7 +3,7 @@
 Telegram phone-lookup bot with Mongo persistence, forced channel membership,
 admin/approval, rate-limiting, inline buttons, and formatted API output.
 
-Environment variables (required):
+Environment variables (required if not hard-coded in your environment):
   TELEGRAM_BOT_TOKEN   - Telegram bot token
   MONGODB_URI          - MongoDB connection string
   ADMIN_IDS            - comma-separated numeric Telegram user ids (admins)
@@ -30,18 +30,22 @@ from urllib.parse import quote_plus
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-# ----------------- Config (from env) -----------------
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-MONGO_URI = os.environ.get("MONGODB_URI")
-ADMIN_IDS = set(int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip())
-FORCE_CHANNEL = os.environ.get("FORCE_CHANNEL", "@datacheak")
-API_BASE = os.environ.get("API_BASE", "https://project-fawn-eight-95.vercel.app/tg2phone/api")
-API_KEY = os.environ.get("API_KEY", "Smoke")
+# load .env if present
+from dotenv import load_dotenv
+load_dotenv()
 
-RATE_LIMIT_COUNT = int(os.environ.get("RATE_LIMIT_COUNT", "10"))
-RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "3600"))
-CALLBACK_TTL = int(os.environ.get("CALLBACK_TTL", "3600"))
-BROADCAST_DELAY = float(os.environ.get("BROADCAST_DELAY", "0.06"))
+# ----------------- Config (from env) -----------------
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+MONGO_URI = os.getenv("MONGODB_URI")
+ADMIN_IDS = set(int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip())
+FORCE_CHANNEL = os.getenv("FORCE_CHANNEL", "@datacheak")
+API_BASE = os.getenv("API_BASE", "https://project-fawn-eight-95.vercel.app/tg2phone/api")
+API_KEY = os.getenv("API_KEY", "Smoke")
+
+RATE_LIMIT_COUNT = int(os.getenv("RATE_LIMIT_COUNT", "10"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "3600"))
+CALLBACK_TTL = int(os.getenv("CALLBACK_TTL", "3600"))
+BROADCAST_DELAY = float(os.getenv("BROADCAST_DELAY", "0.06"))
 
 if not TOKEN:
     raise SystemExit("Set TELEGRAM_BOT_TOKEN environment variable.")
