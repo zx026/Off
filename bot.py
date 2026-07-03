@@ -3,7 +3,7 @@
 Telegram phone-lookup bot with Mongo persistence, forced channel membership,
 admin/approval, rate-limiting, inline buttons, and formatted API output.
 
-Environment variables (required if not hard-coded in your environment):
+Environment variables (preferred, or use a .env file):
   TELEGRAM_BOT_TOKEN   - Telegram bot token
   MONGODB_URI          - MongoDB connection string
   ADMIN_IDS            - comma-separated numeric Telegram user ids (admins)
@@ -438,9 +438,16 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await record_user(update.effective_user)
     await update.message.reply_text(f"Hello — use /phone @username or reply to a user with /phone. Must be member of {FORCE_CHANNEL} (admins/approved bypass).")
 
-# ----------------- Startup -----------------
-async def main():
-    await ensure_indexes()
+# ----------------- Startup (fixed) -----------------
+def main():
+    # Ensure Mongo indexes before starting the bot
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(ensure_indexes())
+    except Exception as e:
+        print("Warning: ensure_indexes() failed:", e)
+
+    # Build application and register handlers
     app = ApplicationBuilder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("phone", phone_cmd))
@@ -450,8 +457,10 @@ async def main():
     app.add_handler(CommandHandler("approveds", approveds_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+
     print("Bot started.")
+    # This call manages the event loop internally (do not wrap in asyncio.run)
     app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
